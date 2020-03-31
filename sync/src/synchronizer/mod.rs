@@ -29,6 +29,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use std::iter;
+use std::thread;
+
 pub const SEND_GET_HEADERS_TOKEN: u64 = 0;
 pub const IBD_BLOCK_FETCH_TOKEN: u64 = 1;
 pub const NOT_IBD_BLOCK_FETCH_TOKEN: u64 = 2;
@@ -41,13 +45,79 @@ const NOT_IBD_BLOCK_FETCH_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 pub struct Synchronizer {
-    chain: ChainController,
+    pub chain: ChainController,
     pub shared: Arc<SyncShared>,
+    pub block_fifo: Arc<Injector<(PeerIndex, Arc<core::BlockView>)>>,
 }
 
 impl Synchronizer {
     pub fn new(chain: ChainController, shared: Arc<SyncShared>) -> Synchronizer {
-        Synchronizer { chain, shared }
+        let synchronizer = Synchronizer {
+            chain,
+            shared,
+            block_fifo: Arc::new(Injector::new()),
+        };
+        synchronizer.start_block_process();
+        synchronizer
+    }
+
+    pub fn push_block(&self, peer: PeerIndex, block: Arc<core::BlockView>) {
+        self.block_fifo.push((peer, block));
+    }
+
+    pub fn start_block_process(&self) {
+        let workers = vec![Worker::new_fifo(), Worker::new_fifo(), Worker::new_fifo()];
+        let stealers = vec![
+            vec![workers[1].stealer(), workers[2].stealer()],
+            vec![workers[0].stealer(), workers[2].stealer()],
+            vec![workers[0].stealer(), workers[1].stealer()],
+        ];
+        let workers: Vec<_> = workers.into_iter().zip(stealers.into_iter()).collect();
+        for (worker, stealers) in workers {
+            let synchronizer = self.clone();
+            let _thread = thread::Builder::new().spawn(move || loop {
+                // Pop a task from the local queue, if not empty.
+                let task = worker.pop().or_else(|| {
+                    // Otherwise, we need to look for a task elsewhere.
+                    iter::repeat_with(|| {
+                                // Try stealing a batch of tasks from the global queue.
+                                synchronizer.block_fifo.steal_batch_and_pop(&worker)
+                                    // Or try stealing a task from one of the other threads.
+                                    .or_else(|| stealers.iter().map(|s| s.steal()).collect())
+                        })
+                        // Loop while no task was stolen and any steal operation needs to be retried.
+                        .find(|s| !s.is_retry())
+                        // Extract the stolen task, if there is one.
+                        .and_then(|s| s.success())
+                });
+
+                if let Some((peer, block)) = task {
+                    synchronizer.process_new_block(peer, block);
+                } else {
+                    let active_chain = synchronizer.shared.active_chain();
+                    let tip_hash = active_chain.tip_hash();
+                    let descendants = synchronizer.shared.state().remove_orphan_by_parent(&tip_hash);
+                    if !descendants.is_empty() {
+                        for block in descendants {
+                            // If we can not find the block's parent in database, that means it was failed to accept
+                            // its parent, so we treat it as an invalid block as well.
+                            if !synchronizer.shared.is_parent_stored(&block) {
+                                continue;
+                            }
+
+                            let block = Arc::new(block);
+                            let _ = synchronizer.shared.accept_block(
+                                &synchronizer.chain,
+                                PeerIndex::new(usize::max_value()),
+                                Arc::clone(&block),
+                            );
+                        }
+                    } else {
+                        thread::yield_now();
+                    }
+                }
+            });
+        }
     }
 
     pub fn shared(&self) -> &Arc<SyncShared> {
@@ -132,7 +202,7 @@ impl Synchronizer {
     pub fn process_new_block(
         &self,
         peer: PeerIndex,
-        block: core::BlockView,
+        block: Arc<core::BlockView>,
     ) -> Result<bool, FailureError> {
         let block_hash = block.hash();
         let status = self.shared.active_chain().get_block_status(&block_hash);
@@ -147,8 +217,7 @@ impl Synchronizer {
                 .set_last_common_header(peer, block.header());
             Ok(false)
         } else if status.contains(BlockStatus::HEADER_VALID) {
-            self.shared
-                .insert_new_block(&self.chain, peer, Arc::new(block))
+            self.shared.insert_new_block(&self.chain, peer, block)
         } else {
             debug!(
                 "Synchronizer process_new_block unexpected status {:?} {}",

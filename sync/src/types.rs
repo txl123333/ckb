@@ -761,7 +761,7 @@ impl SyncShared {
         ret
     }
 
-    fn accept_block(
+    pub fn accept_block(
         &self,
         chain: &ChainController,
         peer: PeerIndex,

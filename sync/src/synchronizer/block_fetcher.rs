@@ -150,7 +150,7 @@ impl BlockFetcher {
                 // stopping synchronization even when orphan_pool maintains dirty items by bugs.
                 let stored = self
                     .active_chain
-                    .contains_block_status(&hash, BlockStatus::BLOCK_STORED);
+                    .contains_block_status(&hash, BlockStatus::BLOCK_RECEIVED);
                 if stored {
                     // If the block is stored, its ancestor must on store
                     // So we can skip the search of this space directly
