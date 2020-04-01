@@ -66,14 +66,17 @@ impl Synchronizer {
     }
 
     pub fn start_block_process(&self) {
-        let workers = vec![Worker::new_fifo(), Worker::new_fifo(), Worker::new_fifo()];
-        let stealers = vec![
-            vec![workers[1].stealer(), workers[2].stealer()],
-            vec![workers[0].stealer(), workers[2].stealer()],
-            vec![workers[0].stealer(), workers[1].stealer()],
-        ];
-        let workers: Vec<_> = workers.into_iter().zip(stealers.into_iter()).collect();
-        for (worker, stealers) in workers {
+        // let workers = vec![Worker::new_fifo(), Worker::new_fifo(), Worker::new_fifo()];
+
+        // let stealers = vec![
+        //     vec![workers[1].stealer(), workers[2].stealer()],
+        //     vec![workers[0].stealer(), workers[2].stealer()],
+        //     vec![workers[0].stealer(), workers[1].stealer()],
+        // ];
+        // let workers: Vec<_> = workers.into_iter().zip(stealers.into_iter()).collect();
+        // for (worker, stealers) in workers
+        {
+            let worker = Worker::new_fifo();
             let synchronizer = self.clone();
             let _thread = thread::Builder::new().spawn(move || loop {
                 // Pop a task from the local queue, if not empty.
@@ -83,7 +86,7 @@ impl Synchronizer {
                                 // Try stealing a batch of tasks from the global queue.
                                 synchronizer.block_fifo.steal_batch_and_pop(&worker)
                                     // Or try stealing a task from one of the other threads.
-                                    .or_else(|| stealers.iter().map(|s| s.steal()).collect())
+                                    // .or_else(|| stealers.iter().map(|s| s.steal()).collect())
                         })
                         // Loop while no task was stolen and any steal operation needs to be retried.
                         .find(|s| !s.is_retry())
